@@ -104,3 +104,16 @@ export function autoGrid(center, radiusKm, land, maxPoints = 400) {
   if (!pts.length) pts = [{ lat: center.lat, lon: center.lon, distKm: 0 }];
   return { spacing, points: pts };
 }
+
+/** Punkt in Entfernung km und Richtung (Grad) vom Start (Großkreis). */
+export function destination(p, km, bearingDeg) {
+  const d = km / R_EARTH, b = rad(bearingDeg), la1 = rad(p.lat), lo1 = rad(p.lon);
+  const la2 = Math.asin(Math.sin(la1) * Math.cos(d) + Math.cos(la1) * Math.sin(d) * Math.cos(b));
+  const lo2 = lo1 + Math.atan2(Math.sin(b) * Math.sin(d) * Math.cos(la1), Math.cos(d) - Math.sin(la1) * Math.sin(la2));
+  return { lat: (la2 * 180) / Math.PI, lon: (lo2 * 180) / Math.PI };
+}
+
+/** Umkreis als Polygon (echte Entfernungen, auch bei 1500 km korrekt). */
+export function geodesicCircle(center, km, n = 96) {
+  return Array.from({ length: n }, (_, i) => destination(center, km, (360 * i) / n));
+}
