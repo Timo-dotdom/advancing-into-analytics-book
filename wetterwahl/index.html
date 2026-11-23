@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Wetterwahl</title>
+  <meta name="description" content="Wo ist in den nächsten 14 Tagen das beste Wetter für unsere Camper-Tour?">
+  <meta name="theme-color" content="#0f1720" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f4f6f8" media="(prefers-color-scheme: light)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Wetterwahl">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1><span aria-hidden="true">☀️</span> Wetterwahl</h1>
+    <button id="btn-settings" class="icon-btn" aria-label="Einstellungen" title="Einstellungen">⚙︎</button>
+  </header>
+
+  <main class="layout">
+    <section class="panel" id="panel">
+      <button type="button" id="summary" class="summary" hidden></button>
+      <form id="form" novalidate>
+        <div class="field">
+          <span class="label">Startpunkt</span>
+          <div class="start-row">
+            <button type="button" id="btn-gps" class="btn">📍 Mein Standort</button>
+            <button type="button" id="btn-pick" class="btn" aria-pressed="false">🗺️ Auf Karte tippen</button>
+          </div>
+          <div class="search">
+            <input id="q" type="search" placeholder="Ort suchen …" autocomplete="off" enterkeyhint="search" aria-label="Ort suchen">
+            <ul id="suggest" class="suggest" hidden></ul>
+          </div>
+          <div id="start-label" class="start-label muted">Noch kein Startpunkt gewählt</div>
+        </div>
+
+        <div class="field">
+          <label for="radius" class="label">Umkreis (Luftlinie) <output id="radius-out"></output></label>
+          <input type="range" id="radius" min="50" max="1500" step="25" value="400">
+        </div>
+
+        <div class="row2">
+          <div class="field">
+            <label for="days" class="label">Reisedauer <output id="days-out"></output></label>
+            <input type="range" id="days" min="1" max="10" step="1" value="4">
+          </div>
+          <div class="field">
+            <label for="earliest" class="label">Frühester Start</label>
+            <select id="earliest"></select>
+          </div>
+        </div>
+
+        <div class="field">
+          <span class="label">Wetterprofil</span>
+          <div class="chips" id="profiles" role="radiogroup" aria-label="Wetterprofil"></div>
+        </div>
+
+        <button type="submit" class="primary" id="btn-search">Beste Regionen finden</button>
+      </form>
+    </section>
+
+    <section class="mapwrap">
+      <div id="map" aria-label="Karte"></div>
+      <div class="legend" id="legend" hidden>
+        <span>Score</span><span class="legend-bar"></span><span class="legend-ticks"><b>0</b><b>50</b><b>100</b></span>
+      </div>
+      <div id="loader" class="loader" hidden>
+        <div class="spinner"></div>
+        <div id="loader-text">Lade Wetterdaten …</div>
+        <div class="progress"><div id="loader-bar"></div></div>
+      </div>
+    </section>
+
+    <section class="results" id="results-wrap">
+      <div id="status" class="status" role="status"></div>
+      <ol id="results" class="results-list"></ol>
+      <p class="footnote">Wetterdaten: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0) ·
+        Karten &amp; Ortsnamen: © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-Mitwirkende ·
+        Küstenlinien: Natural Earth</p>
+    </section>
+  </main>
+
+  <dialog id="details" class="sheet"></dialog>
+  <dialog id="settings" class="sheet"></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
