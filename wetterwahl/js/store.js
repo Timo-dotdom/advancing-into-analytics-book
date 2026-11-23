@@ -34,3 +34,15 @@ export function loadSearch() {
   try { return JSON.parse(localStorage.getItem(KEY_SEARCH)) || null; } catch { return null; }
 }
 export function saveSearch(s) { localStorage.setItem(KEY_SEARCH, JSON.stringify(s)); }
+
+const KEY_RECENT = 'ww:recent:v1';
+export function loadRecent() {
+  try { return JSON.parse(localStorage.getItem(KEY_RECENT)) || []; } catch { return []; }
+}
+/** Merkt sich die letzten 6 Startpunkte (ohne Duplikate in < 5 km). */
+export function addRecent(p) {
+  if (!p?.label) return;
+  const near = (a) => Math.abs(a.lat - p.lat) < 0.05 && Math.abs(a.lon - p.lon) < 0.05;
+  const list = [p, ...loadRecent().filter((a) => !near(a))].slice(0, 6);
+  localStorage.setItem(KEY_RECENT, JSON.stringify(list));
+}

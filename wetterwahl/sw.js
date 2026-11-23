@@ -1,13 +1,13 @@
 // Wetterwahl – Service Worker: App-Shell offline, Kartenkacheln begrenzt zwischenspeichern.
 // Wetterdaten cached die App selbst (localStorage, 3 h).
-const VERSION = 'ww-v1';
+const VERSION = 'ww-v2';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
-  'js/app.js', 'js/api.js', 'js/geo.js', 'js/links.js', 'js/map.js', 'js/regions.js', 'js/score.js', 'js/store.js',
+  'js/app.js', 'js/api.js', 'js/geo.js', 'js/links.js', 'js/map.js', 'js/regions.js', 'js/score.js', 'js/sheet.js', 'js/store.js',
   'data/land.json', 'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/apple-touch-icon.png',
 ];
-const TILES = 'ww-tiles-v1';
+const TILES = 'ww-tiles-v2';
 const MAX_TILES = 400;
 
 self.addEventListener('install', (e) => {
