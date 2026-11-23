@@ -3,6 +3,12 @@
 PWA für Camper-Touren: **Wo im Umkreis X km ist in den nächsten 14 Tagen für N Tage am Stück das beste Wetter?**
 Statisch, ohne Build-Schritt, ohne API-Keys, ohne Kosten.
 
+## Bedienung (App-Layout)
+- Vollbild-Karte, oben Suchleiste + Filter-Chips (Umkreis, Reise, Wetterprofil), Änderungen wirken sofort
+- Bottom-Sheet zum Wischen (klein / halb / voll) mit Top-10-Bewertungskarten; auf dem Desktop feste Seitenleiste
+- Region antippen → Ortskarte mit Park4Night, Route, Kopieren, Teilen, Wetter je Tag; seitlich wischen = nächste Region
+- Karte: OpenStreetMap-Kacheln (ohne Key), Darkmode per Filter
+
 ## Nutzung
 1. Startpunkt: 📍 Standort, Ortssuche oder auf die Karte tippen
 2. Umkreis (50–1500 km), Reisedauer (1–10 Tage), frühester Start, Wetterprofil wählen

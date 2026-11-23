@@ -143,28 +143,46 @@ const HeatLayer = L.Layer.extend({
   },
 });
 
-export function createMap(el, { onClick }) {
-  const map = L.map(el, { zoomControl: true, attributionControl: true, worldCopyJump: true })
+const ATTR = '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
+
+export function createMap(el, { onClick, isDark }) {
+  const map = L.map(el, { zoomControl: false, attributionControl: true, worldCopyJump: true, zoomSnap: 0.25 })
     .setView([50.5, 10], 5);
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 18,
-    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-    className: 'ww-tiles',
-  }).addTo(map);
   map.attributionControl.setPrefix(false);
+  map.attributionControl.setPosition('bottomright');
+
+  // OSM-Standardkacheln (ohne Key); Hell/Dunkel per CSS-Filter (siehe app.css)
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: ATTR, className: 'ww-tiles' }).addTo(map);
+  function setTheme() { /* Darstellung über html.dark in CSS */ }
+  setTheme(isDark());
 
   const heat = new HeatLayer().addTo(map);
-  const circleLayer = L.polygon([], { color: '#4aa3ff', weight: 2, fill: false, dashArray: '6 6', interactive: false }).addTo(map);
+  const circleLayer = L.polygon([], { color: '#0fa3a3', weight: 2, opacity: 0.9, fill: false, dashArray: '2 7', lineCap: 'round', interactive: false }).addTo(map);
   const markers = L.layerGroup().addTo(map);
-  let startMarker = null;
+  const markerById = new Map();
+  let startMarker = null, selected = null;
+  let padding = () => ({ top: 0, bottom: 0, left: 0 });
 
   map.on('click', (e) => onClick?.({ lat: e.latlng.lat, lon: L.Util.wrapNum(e.latlng.lng, [-180, 180], true) }));
 
+  function pad() {
+    const p = padding();
+    return { paddingTopLeft: [p.left + 16, p.top + 16], paddingBottomRight: [16, p.bottom + 16] };
+  }
+  /** Mittelpunkt so verschieben, dass ein Punkt in der Mitte des freien Kartenbereichs liegt. */
+  function centerFor(latlng, zoom) {
+    const p = padding();
+    const pt = map.project(latlng, zoom).add([(-p.left) / 2, (p.bottom - p.top) / 2]);
+    return map.unproject(pt, zoom);
+  }
+
   return {
     map,
+    setTheme,
+    setPadding(fn) { padding = fn; },
     setStart(p) {
       if (!p) return;
-      const icon = L.divIcon({ className: 'ww-start', html: '<span>🚐</span>', iconSize: [34, 34], iconAnchor: [17, 17] });
+      const icon = L.divIcon({ className: 'ww-start', html: '<span><svg><use href="#i-van"/></svg></span>', iconSize: [38, 38], iconAnchor: [19, 19] });
       if (startMarker) startMarker.setLatLng([p.lat, p.lon]);
       else startMarker = L.marker([p.lat, p.lon], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
     },
@@ -172,25 +190,38 @@ export function createMap(el, { onClick }) {
       if (!center) return;
       const ring = geodesicCircle(center, km);
       circleLayer.setLatLngs(ring.map((p) => [p.lat, p.lon]));
-      if (fit) map.fitBounds(circleLayer.getBounds(), { padding: [12, 12] });
+      if (fit) map.fitBounds(circleLayer.getBounds(), { ...pad(), animate: true });
     },
     setHeat(data) {
       heat.setData(data && { ...data, circle: geodesicCircle(data.center, data.radius, 128) });
     },
     setRegions(regions, onSelect) {
       markers.clearLayers();
+      markerById.clear();
+      selected = null;
       regions.forEach((r, i) => {
         const icon = L.divIcon({
-          className: 'ww-rank',
-          html: `<span style="--c:${scoreColor(r.window.score)}">${i + 1}</span>`,
-          iconSize: [28, 28], iconAnchor: [14, 14],
+          className: 'ww-pin',
+          html: `<div class="pin" style="--c:${scoreColor(r.window.score)}"><span>${i + 1}</span></div>`,
+          iconSize: [34, 42], iconAnchor: [17, 40],
         });
-        L.marker([r.lat, r.lon], { icon, zIndexOffset: 500 - i, keyboard: true, title: `Platz ${i + 1}` })
+        const m = L.marker([r.lat, r.lon], { icon, zIndexOffset: 500 - i, keyboard: true, title: `Platz ${i + 1}`, riseOnHover: true })
           .on('click', (e) => { L.DomEvent.stopPropagation(e); onSelect(r, i); })
           .addTo(markers);
+        markerById.set(i, m);
       });
     },
-    focus(p, zoom) { map.setView([p.lat, p.lon], zoom ?? Math.max(map.getZoom(), 8)); },
+    select(i) {
+      if (selected != null) markerById.get(selected)?.getElement()?.classList.remove('sel');
+      selected = i;
+      const m = i != null ? markerById.get(i) : null;
+      if (m) { m.getElement()?.classList.add('sel'); m.setZIndexOffset(2000); }
+    },
+    flyTo(p, zoom) {
+      const z = zoom ?? Math.max(map.getZoom(), 7.5);
+      map.flyTo(centerFor(L.latLng(p.lat, p.lon), z), z, { duration: 0.6 });
+    },
+    fitCircle() { if (circleLayer.getLatLngs()[0]?.length) map.fitBounds(circleLayer.getBounds(), { ...pad(), animate: true }); },
     invalidate() { map.invalidateSize(); },
   };
 }
