@@ -4,6 +4,8 @@ import {
   DEFAULT_PROFILES as P, tempScore, sunScore, rainScore, windScore,
   dayScore, windowScore, bestWindow, ensembleConfidence,
 } from '../js/score.js';
+import { applyDog } from '../js/modes.js';
+const W_DOG = applyDog(P.wandern, true);
 
 const H = 3600;
 // Feste Beispieltage
@@ -15,10 +17,12 @@ const grauerTag = { tmax: 12, tmin: 7, sunshine: 0.5 * H, daylight: 10 * H, prec
 
 test('Temperatur: Wohlfühlbereich, Kälte, Hitze', () => {
   assert.equal(tempScore(20, P.wandern), 1);
-  assert.equal(tempScore(11, P.wandern), 0.5);            // 4 °C unter 15, Kältespanne 8
-  assert.ok(Math.abs(tempScore(28, P.wandern) - 0.6) < 1e-9); // Hitzegrenze Hund
-  assert.ok(Math.abs(tempScore(30, P.wandern) - 0.2) < 1e-9); // steil darüber
-  assert.equal(tempScore(32, P.wandern), 0);
+  assert.equal(tempScore(11, P.wandern), 0.8);            // 4 °C unter 15, Kältespanne 20
+  assert.equal(tempScore(11, P.sonne), 0);                // zum Baden viel zu kalt
+  assert.ok(Math.abs(tempScore(28, W_DOG) - 0.6) < 1e-9); // Hitzegrenze mit Hund
+  assert.ok(Math.abs(tempScore(30, W_DOG) - 0.2) < 1e-9); // steil darüber
+  assert.equal(tempScore(32, W_DOG), 0);
+  assert.ok(tempScore(28, P.wandern) > 0.7, 'ohne Hund ist 28 °C noch ok');
   assert.equal(tempScore(30, P.sonne), 1);
   assert.equal(tempScore(null, P.sonne), null);
 });
@@ -44,13 +48,21 @@ test('Tagesscores: Profile bewerten sinnvoll', () => {
   assert.ok(s(regentag, 'wandern') < 25);
   assert.ok(s(regentag, 'trocken') < 20);
   // Hund: 33 °C muss beim Wandern deutlich abgewertet werden, beim Baden nicht
-  assert.ok(s(hitzetag, 'wandern') < 50, `Hitzetag Wandern = ${s(hitzetag, 'wandern')}`);
+  assert.ok(dayScore(hitzetag, W_DOG).score < 50, `Hitzetag Wandern mit Hund = ${dayScore(hitzetag, W_DOG).score}`);
+  const warm29 = { ...hitzetag, tmax: 29 };
+  assert.ok(dayScore(warm29, W_DOG).score < s(warm29, 'wandern') - 15, `29 °C: mit Hund ${dayScore(warm29, W_DOG).score} vs ohne ${s(warm29, 'wandern')}`);
   assert.ok(s(hitzetag, 'sonne') > 85);
   // Hauptsache trocken: grauer, kühler, aber fast trockener Tag schlägt Regentag klar
   assert.ok(s(grauerTag, 'trocken') > s(regentag, 'trocken') + 30);
   // Ein Regen-Veto darf nicht durch Sonne/Wärme ausgeglichen werden
   const warmerSchauertag = { ...perfekterSommertag, precip: 12, precipProb: 90 };
   assert.ok(s(warmerSchauertag, 'sonne') < 50, `warmer Schauertag = ${s(warmerSchauertag, 'sonne')}`);
+});
+
+test('Kalter, trockener Sonnentag ist ein guter Wandertag (kein Kälte-Veto)', () => {
+  const novemberSonne = { tmax: 4, tmin: -3, sunshine: 7 * H, daylight: 9 * H, precip: 0, precipProb: 5, gust: 15 };
+  assert.ok(dayScore(novemberSonne, P.wandern).score >= 75, `Wandern ${dayScore(novemberSonne, P.wandern).score}`);
+  assert.ok(dayScore(novemberSonne, P.sonne).score < 45, 'Baden bleibt schlecht');
 });
 
 test('Fehlende Werte werden ignoriert, komplett leere Tage ergeben null', () => {

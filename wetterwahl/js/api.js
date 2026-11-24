@@ -1,5 +1,6 @@
 // Wetterwahl – Datenabruf (Open-Meteo, Nominatim) mit lokalem Cache und Rate-Limit-Schutz
 import { parseDaily } from './score.js';
+import { parseHourly } from './modes.js';
 
 const FORECAST = 'https://api.open-meteo.com/v1/forecast';
 const ENSEMBLE = 'https://ensemble-api.open-meteo.com/v1/ensemble';
@@ -50,6 +51,65 @@ export function clearCache() {
     const k = localStorage.key(i);
     if (k?.startsWith(PREFIX)) localStorage.removeItem(k);
   }
+  idb('readwrite', (st) => st.clear()).catch(() => {});
+}
+
+// ---------- IndexedDB (Stundendaten sind für localStorage zu groß) ----------
+let dbPromise = null;
+function openDb() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open('wetterwahl', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('cache');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return dbPromise;
+}
+async function idb(mode, fn) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('cache', mode);
+    const r = fn(tx.objectStore('cache'));
+    tx.oncomplete = () => resolve(r?.result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbGetMany(keys, ttl) {
+  try {
+    const db = await openDb();
+    return await new Promise((resolve) => {
+      const tx = db.transaction('cache', 'readonly');
+      const st = tx.objectStore('cache');
+      const out = new Array(keys.length).fill(null);
+      keys.forEach((k, i) => {
+        const r = st.get(k);
+        r.onsuccess = () => { const v = r.result; if (v && Date.now() - v.t <= ttl) out[i] = v.v; };
+      });
+      tx.oncomplete = () => resolve(out);
+      tx.onerror = () => resolve(out);
+    });
+  } catch { return new Array(keys.length).fill(null); }
+}
+async function idbPutMany(entries) {
+  try {
+    await idb('readwrite', (st) => { for (const [k, v] of entries) st.put({ t: Date.now(), v }, k); });
+  } catch { /* privat-Modus o. Ä. */ }
+}
+/** Abgelaufene Stundendaten entfernen. */
+export async function pruneIdb() {
+  try {
+    const db = await openDb();
+    const tx = db.transaction('cache', 'readwrite');
+    const req = tx.objectStore('cache').openCursor();
+    req.onsuccess = () => {
+      const c = req.result;
+      if (!c) return;
+      if (Date.now() - (c.value?.t || 0) > TTL_FORECAST) c.delete();
+      c.continue();
+    };
+  } catch { /* egal */ }
 }
 const today = () => new Date().toISOString().slice(0, 10);
 const ptKey = (p) => `${p.lat.toFixed(3)},${p.lon.toFixed(3)}`;
@@ -121,6 +181,51 @@ export async function fetchForecast(points, { onProgress, signal } = {}) {
       done += idx.length;
       onProgress?.(done, points.length);
       if (next < batches.length) await sleep(400); // sanft zum Server
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batches.length) }, worker));
+  return result;
+}
+
+// ---------- Stundenwerte (Tagestour / Overnighter) ----------
+const HOURLY = ['temperature_2m', 'precipitation', 'precipitation_probability', 'weather_code', 'wind_gusts_10m', 'sunshine_duration', 'snowfall'].join(',');
+const HOURLY_DAILY = 'sunrise,sunset,temperature_2m_max,temperature_2m_min';
+
+/**
+ * Lädt Stundenwerte von startDate bis endDate (YYYY-MM-DD) für alle Punkte.
+ * Ergebnis je Punkt: { h: parseHourly(...), elevation }
+ */
+export async function fetchHourly(points, { startDate, endDate, onProgress, signal } = {}) {
+  const keys = points.map((p) => `h:${startDate}:${endDate}:${ptKey(p)}`);
+  const cached = await idbGetMany(keys, TTL_FORECAST);
+  const result = cached.map((v) => (v ? { h: parseHourly(v.loc), elevation: v.elevation } : null));
+  const missing = [];
+  result.forEach((r, i) => { if (!r) missing.push(i); });
+  let done = points.length - missing.length;
+  onProgress?.(done, points.length);
+
+  const batches = [];
+  for (let i = 0; i < missing.length; i += BATCH) batches.push(missing.slice(i, i + BATCH));
+  let next = 0;
+  async function worker() {
+    while (next < batches.length) {
+      const idx = batches[next++];
+      const lat = idx.map((i) => points[i].lat).join(',');
+      const lon = idx.map((i) => points[i].lon).join(',');
+      const url = `${FORECAST}?latitude=${lat}&longitude=${lon}&hourly=${HOURLY}&daily=${HOURLY_DAILY}&start_date=${startDate}&end_date=${endDate}&timezone=auto`;
+      const json = await getJson(url, { signal });
+      const arr = Array.isArray(json) ? json : [json];
+      const puts = [];
+      arr.forEach((loc, k) => {
+        const i = idx[k];
+        const slim = { hourly: loc.hourly, daily: loc.daily };
+        result[i] = { h: parseHourly(slim), elevation: loc.elevation };
+        puts.push([keys[i], { loc: slim, elevation: loc.elevation }]);
+      });
+      idbPutMany(puts);
+      done += idx.length;
+      onProgress?.(done, points.length);
+      if (next < batches.length) await sleep(400);
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batches.length) }, worker));
