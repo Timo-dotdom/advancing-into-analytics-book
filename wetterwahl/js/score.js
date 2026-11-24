@@ -11,6 +11,9 @@
  *  gustOk/Bad   Windböen (km/h): darunter 1, darüber 0
  *  vetoes       Teilscore unter diesem Wert drückt den ganzen Tag (Knock-out)
  *  worstWeight  Anteil des schlechtesten Tages am Fensterscore
+ *  dogAware     false = Hund-Schalter ändert nichts (Baden)
+ *  coldVeto     false = Temperatur-Veto nur bei Hitze (Kälte lässt sich wegziehen)
+ *  thunderFactor / snowMaxPenalty  Abzug bei Gewitter / Neuschnee (Stunden-Modi)
  */
 export const DEFAULT_PROFILES = {
   sonne: {
@@ -19,23 +22,37 @@ export const DEFAULT_PROFILES = {
     weights: { sun: 0.40, temp: 0.30, rain: 0.25, wind: 0.05 },
     tempMin: 24, tempMax: 32, coldMargin: 8, heatLimit: 35, heatDrop: 0.2,
     rainBadMm: 5, gustOk: 35, gustBad: 75,
-    vetoes: { rain: 0.4 },
+    vetoes: { rain: 0.4, temp: 0.5 },
     worstWeight: 0.4,
+    dogAware: false,
   },
   wandern: {
     name: 'Wandern',
     icon: '🥾',
     weights: { sun: 0.15, temp: 0.30, rain: 0.35, wind: 0.20 },
-    tempMin: 15, tempMax: 25, coldMargin: 8, heatLimit: 28, heatDrop: 0.2,
+    tempMin: 15, tempMax: 25, coldMargin: 20, heatLimit: 30, heatDrop: 0.2,
     rainBadMm: 6, gustOk: 25, gustBad: 60,
     vetoes: { rain: 0.4, temp: 0.4 },
+    coldVeto: false,
     worstWeight: 0.4,
+  },
+  berg: {
+    name: 'Bergtour',
+    icon: '⛰️',
+    weights: { sun: 0.20, temp: 0.20, rain: 0.35, wind: 0.25 },
+    tempMin: 8, tempMax: 20, coldMargin: 18, heatLimit: 27, heatDrop: 0.2,
+    coldVeto: false,
+    rainBadMm: 4, gustOk: 30, gustBad: 55,
+    vetoes: { rain: 0.45, wind: 0.35 },
+    worstWeight: 0.4,
+    thunderFactor: 0.2, snowMaxPenalty: 0.7,
   },
   trocken: {
     name: 'Hauptsache trocken',
     icon: '☂️',
     weights: { sun: 0.15, temp: 0.10, rain: 0.65, wind: 0.10 },
-    tempMin: 10, tempMax: 30, coldMargin: 10, heatLimit: 35, heatDrop: 0.2,
+    tempMin: 10, tempMax: 30, coldMargin: 20, heatLimit: 35, heatDrop: 0.2,
+    coldVeto: false,
     rainBadMm: 4, gustOk: 35, gustBad: 75,
     vetoes: { rain: 0.5 },
     worstWeight: 0.4,
@@ -107,7 +124,10 @@ export function dayScore(day, p) {
   }
   if (wsum === 0 || parts.rain === null && parts.temp === null) return { score: null, parts };
   let factor = 1;
-  for (const [k, thr] of Object.entries(p.vetoes || {})) factor *= vetoFactor(parts[k], thr);
+  for (const [k, thr] of Object.entries(p.vetoes || {})) {
+    if (k === 'temp' && p.coldVeto === false && isNum(day.tmax) && day.tmax < p.tempMin) continue;
+    factor *= vetoFactor(parts[k], thr);
+  }
   return { score: Math.round(100 * (sum / wsum) * factor * 10) / 10, parts };
 }
 

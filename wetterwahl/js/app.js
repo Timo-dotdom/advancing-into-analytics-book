@@ -1,12 +1,15 @@
-// Wetterwahl – App-Steuerung
+// Wetterwahl – App-Steuerung (Modi: Van-Tour, Tagestour, Overnighter)
 import { prepareLand, autoGrid, haversineKm, driveHours, formatDuration } from './geo.js';
 import { ensembleConfidence } from './score.js';
 import { scorePoints, clusterRegions } from './regions.js';
-import { fetchForecast, fetchEnsemble, searchPlace, reverseName, pruneCache, clearCache } from './api.js';
+import {
+  MODES, MODE_PROFILES, SHELTERS, applyDog, scoreHourlyPoints, candidateDates, weekendDates, addDays, hourRows,
+} from './modes.js';
+import { fetchForecast, fetchHourly, fetchEnsemble, searchPlace, reverseName, pruneCache, pruneIdb, clearCache } from './api.js';
 import { loadSettings, saveSettings, loadSearch, saveSearch, defaultProfile, loadRecent, addRecent } from './store.js';
 import { createMap, scoreColor } from './map.js';
 import { createSheet } from './sheet.js';
-import { park4nightUrl, park4nightWebUrl, appleMapsUrl, coordText, copyText } from './links.js';
+import { park4nightUrl, park4nightWebUrl, appleMapsUrl, komootUrl, coordText, copyText } from './links.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -15,12 +18,18 @@ const icon = (id, cls = '') => `<svg class="${cls}" aria-hidden="true"><use href
 // ---------- Zustand ----------
 let settings = loadSettings();
 const saved = loadSearch() || {};
+const validMode = (m) => (MODES[m] ? m : 'van');
 const state = {
+  mode: validMode(saved.mode),
   start: saved.start || null,
-  radius: saved.radius || 400,
+  radii: { van: 400, day: 80, night: 120, ...(saved.radii || {}) },
   days: saved.days || 4,
   earliest: saved.earliest || 0,
-  profile: saved.profile && settings.profiles[saved.profile] ? saved.profile : 'wandern',
+  span: saved.span ?? 7,               // Stunden-Modi: 'we' | 3 | 7 | 14
+  profiles: { van: 'wandern', day: 'wandern', ...(saved.profiles || {}) },
+  shelter: SHELTERS[saved.shelter] ? saved.shelter : 'zelt',
+  dog: !!saved.dog,
+  minElev: saved.minElev || 0,
   lastRun: saved.lastRun || 0,
   picking: false,
   land: null,
@@ -32,9 +41,18 @@ const state = {
   busy: false,
   error: null,
   view: 'list',
-  detail: null,     // aktuell gezeigter Punkt
+  detail: null,
   listScroll: 0,
 };
+if (saved.radius && !saved.radii) state.radii.van = saved.radius; // alte Version
+const M = () => MODES[state.mode];
+const radius = () => state.radii[state.mode];
+const profileId = () => {
+  const allowed = MODE_PROFILES[state.mode] || ['wandern'];
+  const p = state.profiles[state.mode];
+  return allowed.includes(p) && settings.profiles[p] ? p : allowed.find((x) => settings.profiles[x]) || 'wandern';
+};
+const activeProfile = () => applyDog(settings.profiles[state.mode === 'night' ? 'wandern' : profileId()], state.dog);
 
 // ---------- Theme ----------
 const darkMQ = window.matchMedia('(prefers-color-scheme: dark)');
@@ -46,12 +64,13 @@ function applyTheme() {
 }
 applyTheme();
 pruneCache();
+pruneIdb();
 
 const ui = createMap($('#map'), { onClick: onMapClick, isDark });
 darkMQ.addEventListener('change', () => { applyTheme(); ui.setTheme(isDark()); });
 
 const sheet = createSheet($('#sheet'), $('#sheet-scroll'), {
-  onChange: (s) => document.body.dataset.sheet = s,
+  onChange: (s) => (document.body.dataset.sheet = s),
 });
 ui.setPadding(() => sheet.isDesktop()
   ? { left: $('#sheet').getBoundingClientRect().right, top: 0, bottom: 0 }
@@ -66,13 +85,22 @@ function dayDate(offset) {
   d.setDate(d.getDate() + offset);
   return d;
 }
+const isoLocal = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const todayIso = () => isoLocal(dayDate(0));
 const asDate = (d) => (typeof d === 'string' ? new Date(d + 'T12:00:00') : d);
 const fmtDate = (d) => { d = asDate(d); return `${WD[d.getDay()]} ${d.getDate()}.${d.getMonth() + 1}.`; };
 const fmtRange = (a, b) => { a = asDate(a); b = asDate(b); return `${WD[a.getDay()]} ${a.getDate()}.${a.getMonth() === b.getMonth() ? '' : a.getMonth() + 1 + '.'} – ${fmtDate(b)}`; };
 function relDay(i) { return i === 0 ? 'Heute' : i === 1 ? 'Morgen' : fmtDate(dayDate(i)); }
-const round = (x) => (x == null ? '–' : Math.round(x));
+function relIso(iso) {
+  const t = todayIso();
+  if (iso === t) return 'Heute';
+  if (iso === addDays(t, 1)) return 'Morgen';
+  return fmtDate(iso);
+}
+const round = (x) => (x == null || !Number.isFinite(x) ? '–' : Math.round(x));
 const hours = (s) => (s == null ? '–' : (s / 3600).toFixed(s >= 36000 ? 0 : 1).replace('.', ','));
 const mm = (x) => (x == null ? '–' : x < 0.1 ? '0' : x.toFixed(x < 10 ? 1 : 0).replace('.', ','));
+const hhmm = (iso) => (iso ? iso.slice(11, 16) : '–');
 function weatherIcon(d) {
   if (d.precip != null && d.precip >= 1 && (d.precipProb ?? 60) >= 50) return d.precip >= 8 ? '🌧️' : '🌦️';
   const ratio = d.daylight ? (d.sunshine ?? 0) / d.daylight : 0;
@@ -81,6 +109,29 @@ function weatherIcon(d) {
   if (ratio > 0.1) return '⛅';
   return '☁️';
 }
+/** Icon aus WMO-Wettercode (Stundenwerte). */
+function codeIcon(code, night = false) {
+  if (code == null) return '·';
+  if (code >= 95) return '⛈️';
+  if (code >= 85 || (code >= 71 && code <= 77)) return '🌨️';
+  if (code >= 80) return '🌦️';
+  if (code >= 61) return '🌧️';
+  if (code >= 51) return '🌦️';
+  if (code >= 45) return '🌫️';
+  if (code === 3) return '☁️';
+  if (code === 2) return night ? '☁️' : '⛅';
+  return night ? '🌙' : code === 1 ? '🌤️' : '☀️';
+}
+/** Haupt-Icon für einen Zeitabschnitt (Aggregat). */
+function aggIcon(a, night = false) {
+  if (!a) return '·';
+  if (a.thunder) return '⛈️';
+  if (a.snow > 0.5) return '🌨️';
+  if (a.precip >= 1 && (a.probMax ?? 60) >= 50) return a.precip >= 6 ? '🌧️' : '🌦️';
+  if (night) return a.precip >= 0.3 ? '🌦️' : '🌙';
+  const r = a.sunSec / (a.n * 3600);
+  return r > 0.6 ? '☀️' : r > 0.3 ? '🌤️' : r > 0.1 ? '⛅' : '☁️';
+}
 function ratingLabel(s) {
   return s >= 85 ? 'Hervorragend' : s >= 70 ? 'Sehr gut' : s >= 55 ? 'Gut' : s >= 40 ? 'Durchwachsen' : 'Schlecht';
 }
@@ -88,7 +139,13 @@ function bubbles(score) {
   const v = Math.round((score / 20) * 2) / 2;
   let h = '';
   for (let i = 1; i <= 5; i++) h += `<i class="${v >= i ? 'f' : v >= i - 0.5 ? 'h' : ''}"></i>`;
-  return `<span class="bubbles" aria-label="${(v).toString().replace('.', ',')} von 5">${h}</span>`;
+  return `<span class="bubbles" aria-label="${v.toString().replace('.', ',')} von 5">${h}</span>`;
+}
+function dryText(a) {
+  if (!a) return '';
+  if (a.dryHours >= a.n) return 'durchgehend trocken';
+  if (!a.dryBlock || a.dryBlock[1] - a.dryBlock[0] < 2) return 'kaum trocken';
+  return `trocken ${a.dryBlock[0]}–${a.dryBlock[1]} Uhr`;
 }
 
 function toast(msg, ms = 2600) {
@@ -101,7 +158,27 @@ function toast(msg, ms = 2600) {
 }
 
 function persist() {
-  saveSearch({ start: state.start, radius: state.radius, days: state.days, earliest: state.earliest, profile: state.profile, lastRun: state.lastRun });
+  saveSearch({
+    mode: state.mode, start: state.start, radii: state.radii, days: state.days, earliest: state.earliest,
+    span: state.span, profiles: state.profiles, shelter: state.shelter, dog: state.dog, minElev: state.minElev, lastRun: state.lastRun,
+  });
+}
+
+// ---------- Suchzeitraum (Stunden-Modi) ----------
+const HORIZON = 16;
+function spanLabel() {
+  if (state.span === 'we') return 'Wochenende';
+  return `${state.span} ${state.mode === 'night' ? 'Nächte' : 'Tage'}`;
+}
+/** Kandidaten (Tage bzw. Nächte) und benötigter Datenbereich. */
+function hourlyPlan() {
+  const first = isoLocal(dayDate(state.earliest));
+  const lastAllowed = isoLocal(dayDate(HORIZON - 1 - (state.mode === 'night' ? 1 : 0)));
+  let dates = state.span === 'we' ? weekendDates(first, state.mode, 14) : candidateDates(first, state.span);
+  dates = dates.filter((d) => d <= lastAllowed);
+  if (!dates.length) dates = [first <= lastAllowed ? first : lastAllowed];
+  const end = state.mode === 'night' ? addDays(dates.at(-1), 1) : dates.at(-1);
+  return { dates, start: dates[0], end };
 }
 
 // ---------- Kopfzeile & Chips ----------
@@ -109,22 +186,59 @@ function renderTop() {
   const st = $('#start-text');
   st.textContent = state.start ? (state.start.label || coordText(state.start.lat, state.start.lon)) : 'Wo startet ihr?';
   st.classList.toggle('placeholder', !state.start);
-  const chips = Object.entries(settings.profiles).map(([id, p]) =>
-    `<button class="chip${id === state.profile ? ' on' : ''}" data-profile="${id}" aria-pressed="${id === state.profile}">${p.icon || ''} ${esc(p.name)}</button>`);
-  chips.splice(0, 0,
-    `<button class="chip param" data-param="radius">◎ ${state.radius} km</button>`,
-    `<button class="chip param" data-param="trip">📅 ${state.days} ${state.days === 1 ? 'Tag' : 'Tage'} · ab ${relDay(state.earliest)}</button>`);
+  const chips = [`<button class="chip mode" data-param="mode">${M().icon} ${M().name} <span class="caret">▾</span></button>`];
+  chips.push(`<button class="chip param" data-param="radius">◎ ${radius()} km</button>`);
+  if (state.mode === 'van') {
+    chips.push(`<button class="chip param" data-param="trip">📅 ${state.days} ${state.days === 1 ? 'Tag' : 'Tage'} · ab ${relDay(state.earliest)}</button>`);
+  } else {
+    chips.push(`<button class="chip param" data-param="trip">📅 ${spanLabel()} · ab ${relDay(state.earliest)}</button>`);
+  }
+  if (state.mode === 'night') {
+    for (const [id, s] of Object.entries(SHELTERS)) {
+      chips.push(`<button class="chip${id === state.shelter ? ' on' : ''}" data-shelter="${id}" aria-pressed="${id === state.shelter}">${s.icon} ${s.name}</button>`);
+    }
+  } else {
+    for (const id of MODE_PROFILES[state.mode]) {
+      const p = settings.profiles[id];
+      if (!p) continue;
+      chips.push(`<button class="chip${id === profileId() ? ' on' : ''}" data-profile="${id}" aria-pressed="${id === profileId()}">${p.icon || ''} ${esc(p.name)}</button>`);
+    }
+  }
+  chips.push(`<button class="chip${state.dog ? ' on' : ''}" data-toggle="dog" aria-pressed="${state.dog}">🐕 Hund</button>`);
+  if (M().hourly) {
+    chips.push(`<button class="chip${state.minElev ? ' on' : ''}" data-toggle="elev">⛰️ ${state.minElev ? `ab ${state.minElev} m` : 'Höhe egal'}</button>`);
+  }
   $('#chiprow').innerHTML = chips.join('');
 }
 $('#chiprow').addEventListener('click', (e) => {
   const b = e.target.closest('.chip');
   if (!b) return;
   if (b.dataset.profile) {
-    if (state.profile === b.dataset.profile) return;
-    state.profile = b.dataset.profile;
+    if (profileId() === b.dataset.profile) return;
+    state.profiles[state.mode] = b.dataset.profile;
+    persist(); renderTop(); rescore();
+  } else if (b.dataset.shelter) {
+    if (state.shelter === b.dataset.shelter) return;
+    state.shelter = b.dataset.shelter;
+    persist(); renderTop(); rescore();
+  } else if (b.dataset.toggle === 'dog') {
+    state.dog = !state.dog;
+    toast(state.dog ? '🐕 Hund dabei: über 28 °C wird stark abgewertet' : 'Ohne Hund');
+    persist(); renderTop(); rescore();
+  } else if (b.dataset.toggle === 'elev') {
+    state.minElev = { 0: 500, 500: 1000, 1000: 0 }[state.minElev] ?? 0;
     persist(); renderTop(); rescore();
   } else openParam(b.dataset.param);
 });
+
+function setMode(m) {
+  if (m === state.mode) return;
+  state.mode = m;
+  if (state.view === 'detail') closeDetail(false);
+  persist(); renderTop();
+  ui.setRadius(state.start, radius(), true);
+  if (state.start) runSearch(); else renderList();
+}
 
 // ---------- Startpunkt ----------
 function setStart(p, label, { search = true } = {}) {
@@ -132,7 +246,7 @@ function setStart(p, label, { search = true } = {}) {
   state.picking = false;
   document.body.classList.remove('picking');
   ui.setStart(state.start);
-  ui.setRadius(state.start, state.radius, true);
+  ui.setRadius(state.start, radius(), true);
   renderTop();
   persist();
   if (label) addRecent(state.start);
@@ -230,56 +344,87 @@ $('#q').addEventListener('keydown', (e) => {
 // ---------- Parameter-Sheets ----------
 const paramDlg = $('#param');
 let paramBefore = null;
+const QUICK_RADII = { van: [100, 250, 400, 600, 1000, 1500], day: [25, 50, 80, 120, 180, 250], night: [25, 50, 100, 150, 250, 400] };
 function openParam(kind) {
-  paramBefore = { radius: state.radius, days: state.days, earliest: state.earliest, kind };
+  paramBefore = { radius: radius(), days: state.days, earliest: state.earliest, span: state.span, mode: state.mode, kind };
   renderParam(kind);
   paramDlg.showModal();
 }
 function renderParam(kind) {
-  if (kind === 'radius') {
-    const maxH = formatDuration(driveHours(state.radius, settings.detour, settings.speed));
-    paramDlg.innerHTML = `
-      <div class="ms-grip"></div>
-      <div class="ms-head"><h3>Umkreis</h3><button class="text-btn strong" data-done>Fertig</button></div>
-      <div class="big-value"><b id="rv">${state.radius}</b> km <span class="muted" id="rh">Luftlinie · bis ${maxH} Fahrt</span></div>
-      <input type="range" id="r-range" min="50" max="1500" step="25" value="${state.radius}" aria-label="Umkreis in km">
-      <div class="seg">${[100, 250, 400, 600, 1000, 1500].map((v) => `<button data-r="${v}" class="${v === state.radius ? 'on' : ''}">${v}</button>`).join('')}</div>`;
-  } else {
-    paramDlg.innerHTML = `
-      <div class="ms-grip"></div>
-      <div class="ms-head"><h3>Reise</h3><button class="text-btn strong" data-done>Fertig</button></div>
+  const head = (t) => `<div class="ms-grip"></div><div class="ms-head"><h3>${t}</h3><button class="text-btn strong" data-done>Fertig</button></div>`;
+  if (kind === 'mode') {
+    paramDlg.innerHTML = head('Was habt ihr vor?') + `<ul class="list-group inset mode-list">${Object.entries(MODES).map(([id, m]) => `
+      <li><button data-mode="${id}" class="${id === state.mode ? 'on' : ''}">
+        <span class="mode-ico">${m.icon}</span>
+        <span class="li-t"><b>${m.name}</b><small>${m.desc}</small></span>
+        ${id === state.mode ? '<span class="check">✓</span>' : ''}
+      </button></li>`).join('')}</ul>`;
+  } else if (kind === 'radius') {
+    const [min, max] = M().radius;
+    const step = max > 500 ? 25 : 5;
+    const maxH = formatDuration(driveHours(radius(), settings.detour, settings.speed));
+    paramDlg.innerHTML = head('Umkreis') + `
+      <div class="big-value"><b id="rv">${radius()}</b> km <span class="muted" id="rh">Luftlinie · bis ${maxH} Anfahrt</span></div>
+      <input type="range" id="r-range" min="${min}" max="${max}" step="${step}" value="${radius()}" aria-label="Umkreis in km">
+      <div class="seg">${QUICK_RADII[state.mode].map((v) => `<button data-r="${v}" class="${v === radius() ? 'on' : ''}">${v}</button>`).join('')}</div>`;
+  } else if (state.mode === 'van') {
+    paramDlg.innerHTML = head('Reise') + `
       <div class="stepper-row"><span>Reisedauer</span>
         <div class="stepper"><button data-d="-1" aria-label="weniger">−</button><b>${state.days} ${state.days === 1 ? 'Tag' : 'Tage'}</b><button data-d="1" aria-label="mehr">+</button></div></div>
-      <div class="sub-label">Frühester Start</div>
-      <div class="day-grid">${Array.from({ length: 15 }, (_, i) => {
-        const d = dayDate(i);
-        return `<button data-e="${i}" class="${i === state.earliest ? 'on' : ''}"><small>${i === 0 ? 'Heute' : i === 1 ? 'Morgen' : WD[d.getDay()]}</small><b>${d.getDate()}.</b></button>`;
-      }).join('')}</div>
+      <div class="sub-label">Frühester Start</div>${dayGrid()}
       <p class="fine">Die App sucht das beste Fenster ab diesem Tag innerhalb der 16-Tage-Prognose.</p>`;
+  } else {
+    const night = state.mode === 'night';
+    paramDlg.innerHTML = head(night ? 'Welche Nacht?' : 'Welcher Tag?') + `
+      <div class="sub-label">Suchzeitraum</div>
+      <div class="seg">${[['we', 'Wochenende'], [3, `3 ${night ? 'Nächte' : 'Tage'}`], [7, `7 ${night ? 'Nächte' : 'Tage'}`], [14, '14']].map(([v, l]) =>
+        `<button data-span="${v}" class="${String(v) === String(state.span) ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <div class="sub-label">${night ? 'Erste Nacht ab' : 'Ab'}</div>${dayGrid()}
+      <p class="fine">${night ? 'Bewertet je Nacht: Nachmittag (14–20 Uhr), Nacht (20–7 Uhr) und Morgen zum Zusammenpacken (7–11 Uhr). Wochenende = Nächte Fr→Sa und Sa→So.' : `Bewertet die Wanderzeit ${settings.hikeStart}–${settings.hikeEnd} Uhr (änderbar in den Einstellungen). Wochenende = Sa und So.`}</p>`;
   }
+}
+function dayGrid() {
+  return `<div class="day-grid">${Array.from({ length: 15 }, (_, i) => {
+    const d = dayDate(i);
+    return `<button data-e="${i}" class="${i === state.earliest ? 'on' : ''}"><small>${i === 0 ? 'Heute' : i === 1 ? 'Morgen' : WD[d.getDay()]}</small><b>${d.getDate()}.</b></button>`;
+  }).join('')}</div>`;
 }
 paramDlg.addEventListener('input', (e) => {
   if (e.target.id !== 'r-range') return;
-  state.radius = +e.target.value;
-  $('#rv').textContent = state.radius;
-  $('#rh').textContent = `Luftlinie · bis ${formatDuration(driveHours(state.radius, settings.detour, settings.speed))} Fahrt`;
-  paramDlg.querySelectorAll('[data-r]').forEach((b) => b.classList.toggle('on', +b.dataset.r === state.radius));
-  ui.setRadius(state.start, state.radius);
+  state.radii[state.mode] = +e.target.value;
+  $('#rv').textContent = radius();
+  $('#rh').textContent = `Luftlinie · bis ${formatDuration(driveHours(radius(), settings.detour, settings.speed))} Anfahrt`;
+  paramDlg.querySelectorAll('[data-r]').forEach((b) => b.classList.toggle('on', +b.dataset.r === radius()));
+  ui.setRadius(state.start, radius());
 });
 paramDlg.addEventListener('click', (e) => {
   if (e.target === paramDlg || e.target.closest('[data-done]')) return paramDlg.close();
   const b = e.target.closest('button');
   if (!b) return;
-  if (b.dataset.r) { state.radius = +b.dataset.r; renderParam('radius'); ui.setRadius(state.start, state.radius, true); }
+  if (b.dataset.mode) { paramBefore.newMode = b.dataset.mode; paramDlg.close(); return; }
+  if (b.dataset.r) { state.radii[state.mode] = +b.dataset.r; renderParam('radius'); ui.setRadius(state.start, radius(), true); }
   if (b.dataset.d) { state.days = Math.max(1, Math.min(10, state.days + +b.dataset.d)); renderParam('trip'); }
   if (b.dataset.e) { state.earliest = +b.dataset.e; renderParam('trip'); }
+  if (b.dataset.span) { state.span = b.dataset.span === 'we' ? 'we' : +b.dataset.span; renderParam('trip'); }
 });
 paramDlg.addEventListener('close', () => {
   const b = paramBefore;
+  if (b.newMode) { setMode(b.newMode); return; }
   renderTop(); persist();
-  if (b.radius !== state.radius) { ui.setRadius(state.start, state.radius, true); if (state.start) runSearch(); }
-  else if (b.days !== state.days || b.earliest !== state.earliest) rescore();
+  if (b.radius !== radius()) { ui.setRadius(state.start, radius(), true); if (state.start) runSearch(); return; }
+  if (b.days !== state.days || b.earliest !== state.earliest || b.span !== state.span) {
+    if (M().hourly && !dataCovers()) runSearch(); else rescore();
+  }
 });
+
+/** Deckt der geladene Stunden-Datensatz den aktuellen Suchzeitraum ab? */
+function dataCovers() {
+  const d = state.data;
+  if (!d || d.mode !== state.mode) return false;
+  if (!M().hourly) return true;
+  const plan = hourlyPlan();
+  return plan.start >= d.range.start && plan.end <= d.range.end;
+}
 
 // ---------- Karte ----------
 function onMapClick(p) {
@@ -287,6 +432,7 @@ function onMapClick(p) {
   if (!state.scored.length) return;
   let best = null, bd = Infinity;
   for (const s of state.scored) {
+    if (!s.window) continue;
     const d = haversineKm(p, s);
     if (d < bd) { bd = d; best = s; }
   }
@@ -313,8 +459,10 @@ async function ensureLand() {
   return state.land;
 }
 
+let searchRun = 0;
 async function runSearch({ silent = false } = {}) {
-  if (state.busy || !state.start) return;
+  if (!state.start) return;
+  const run = ++searchRun;
   state.busy = true;
   state.error = null;
   if (state.view === 'detail') closeDetail(false);
@@ -325,23 +473,36 @@ async function runSearch({ silent = false } = {}) {
   setProgress(0.02);
   try {
     const land = await ensureLand();
+    const mode = state.mode;
     const center = { lat: state.start.lat, lon: state.start.lon };
-    const { spacing, points } = autoGrid(center, state.radius, land, settings.maxPoints);
-    const fc = await fetchForecast(points, {
-      onProgress: (done, total) => {
-        setProgress(done / total);
-        state.loadingText = `Wetter für ${done} von ${total} Orten …`;
-        const el = $('#loading-text');
-        if (el) el.textContent = state.loadingText;
-      },
-    });
-    state.data = { center, radius: state.radius, spacing, points: points.map((p, i) => ({ ...p, days: fc[i].days, elevation: fc[i].elevation })) };
+    const r = radius();
+    const { spacing, points } = autoGrid(center, r, land, settings.maxPoints);
+    const onProgress = (done, total) => {
+      if (run !== searchRun) return;
+      setProgress(done / total);
+      state.loadingText = `Wetter für ${done} von ${total} Orten …`;
+      const el = $('#loading-text');
+      if (el) el.textContent = state.loadingText;
+    };
+    let data;
+    if (MODES[mode].hourly) {
+      const plan = hourlyPlan();
+      const res = await fetchHourly(points, { startDate: plan.start, endDate: plan.end, onProgress });
+      data = { mode, center, radius: r, spacing, range: { start: plan.start, end: plan.end },
+        points: points.map((p, i) => ({ ...p, h: res[i].h, elevation: res[i].elevation })) };
+    } else {
+      const fc = await fetchForecast(points, { onProgress });
+      data = { mode, center, radius: r, spacing, points: points.map((p, i) => ({ ...p, days: fc[i].days, elevation: fc[i].elevation })) };
+    }
+    if (run !== searchRun) return;
+    state.data = data;
     state.lastRun = Date.now();
     persist();
     state.busy = false;
     setProgress(null);
     rescore({ fit: !hadResults || !silent });
   } catch (err) {
+    if (run !== searchRun) return;
     console.error(err);
     state.busy = false;
     state.error = err.message || String(err);
@@ -350,17 +511,34 @@ async function runSearch({ silent = false } = {}) {
   }
 }
 
-/** Neu bewerten ohne neuen Abruf (Profil, Dauer, Startdatum). */
+/** Neu bewerten ohne neuen Abruf. */
 function rescore({ fit = false } = {}) {
   const d = state.data;
   if (!d || state.busy) return;
-  const profile = settings.profiles[state.profile];
-  const nDays = d.points[0]?.days.length || 16;
-  const startMax = nDays - state.days;
-  const startMin = Math.min(state.earliest, startMax);
-  state.startClamped = startMin < state.earliest ? startMin : null;
-  state.scored = scorePoints(d.points, { n: state.days, startMin, startMax, profile });
-  state.regions = clusterRegions(state.scored, Math.max(80, 2 * d.spacing), 10);
+  if (d.mode !== state.mode) { runSearch(); return; }
+  const profile = activeProfile();
+  let minDist;
+  if (M().hourly) {
+    const plan = hourlyPlan();
+    const dates = plan.dates.filter((x) => x >= d.range.start && x <= d.range.end);
+    state.plan = { ...plan, dates };
+    const pts = d.points.filter((p) => !state.minElev || (p.elevation ?? 0) >= state.minElev);
+    const scored = scoreHourlyPoints(pts, {
+      mode: state.mode, dates, profile, shelter: SHELTERS[state.shelter], comfort: settings.comfort,
+      hike: { start: settings.hikeStart, end: settings.hikeEnd },
+    });
+    state.scored = scored;
+    state.startClamped = null;
+    minDist = Math.max(state.mode === 'day' ? 15 : 20, 2 * d.spacing);
+  } else {
+    const nDays = d.points[0]?.days.length || 16;
+    const startMax = nDays - state.days;
+    const startMin = Math.min(state.earliest, startMax);
+    state.startClamped = startMin < state.earliest ? startMin : null;
+    state.scored = scorePoints(d.points, { n: state.days, startMin, startMax, profile });
+    minDist = Math.max(80, 2 * d.spacing);
+  }
+  state.regions = clusterRegions(state.scored, minDist, 10);
 
   ui.setHeat({
     center: d.center, radius: d.radius, spacing: d.spacing, land: state.land,
@@ -369,7 +547,6 @@ function rescore({ fit = false } = {}) {
   ui.setStart(state.start);
   ui.setRadius(d.center, d.radius, fit);
   ui.setRegions(state.regions, (r) => showDetail(r));
-  document.body.classList.add('has-results');
   if (state.view === 'detail') {
     const ri = state.regions.findIndex((r) => r.lat === state.detail?.lat && r.lon === state.detail?.lon);
     if (ri >= 0) showDetail(state.regions[ri], { keepSnap: true, fly: false });
@@ -379,56 +556,102 @@ function rescore({ fit = false } = {}) {
   loadRegionExtras();
 }
 
-// ---------- Liste ----------
-function confBadge(p) {
-  const c = p.confidence;
-  const end = p.window.start + state.days - 1;
-  const far = end >= 9 ? '<span class="tag dashed" title="Fenster reicht bis Tag 10 oder später">ab Tag 10</span>' : '';
-  if (!c) return `<span class="tag loading">Sicherheit …</span>${far}`;
-  const txt = { hoch: 'Sicherheit hoch', mittel: 'Sicherheit mittel', niedrig: 'Sicherheit niedrig', unbekannt: 'Sicherheit ?' }[c.level];
-  return `<span class="tag conf-${c.level}"><i></i>${txt}</span>${far}`;
-}
-function dayStrip(p) {
-  const w = p.window;
-  let cells = '';
-  for (let i = w.start; i < w.start + state.days; i++) {
-    const d = p.days[i];
-    if (!d) continue;
-    cells += `<div class="dc" style="--c:${scoreColor(p.dayScores[i] ?? 0)}">
-      <div class="dc-d">${WD[asDate(d.date).getDay()]}</div>
-      <div class="dc-i">${weatherIcon(d)}</div>
-      <div class="dc-t"><b>${round(d.tmax)}°</b> ${round(d.tmin)}°</div>
-      <div class="dc-r">${mm(d.precip)} mm</div>
-      <div class="dc-s">${hours(d.sunshine)} h ☀︎</div>
-    </div>`;
-  }
-  return `<div class="strip">${cells}</div>`;
-}
-function nameOf(p) {
-  return state.names.get(`${p.lat},${p.lon}`) || null;
-}
+// ---------- gemeinsame Bausteine ----------
+const nameOf = (p) => state.names.get(`${p.lat},${p.lon}`) || null;
+function placeName(p) { return nameOf(p)?.name?.split(' · ')[0] || null; }
 function titleHtml(p) {
-  const n = nameOf(p);
-  if (!n?.name) return `<span class="muted">${p.lat.toFixed(2)}° N, ${p.lon.toFixed(2)}° O</span>`;
-  const [place] = n.name.split(' · ');
-  return esc(place);
+  const n = placeName(p);
+  return n ? esc(n) : `<span class="muted">${p.lat.toFixed(2)}° N, ${p.lon.toFixed(2)}° O</span>`;
 }
 function subHtml(p) {
   const n = nameOf(p);
   if (!n?.name) return '';
-  const area = n.name.split(' · ')[1];
-  return [area, n.country].filter(Boolean).map(esc).join(' · ');
+  return [n.name.split(' · ')[1], n.country].filter(Boolean).map(esc).join(' · ');
+}
+function windowDates(p) {
+  const w = p.window;
+  if (!w) return [];
+  if (state.mode === 'van') return p.days.slice(w.start, w.start + state.days).map((d) => d.date);
+  return state.mode === 'night' ? [w.date, addDays(w.date, 1)] : [w.date];
+}
+function windowEndsLate(p) {
+  const last = windowDates(p).at(-1);
+  return last && last >= isoLocal(dayDate(9));
+}
+function confBadge(p) {
+  const c = p.confidence;
+  const far = windowEndsLate(p) ? '<span class="tag dashed" title="reicht bis Tag 10 oder später">ab Tag 10</span>' : '';
+  if (!c) return `<span class="tag loading">Sicherheit …</span>${far}`;
+  const txt = { hoch: 'Sicherheit hoch', mittel: 'Sicherheit mittel', niedrig: 'Sicherheit niedrig', unbekannt: 'Sicherheit ?' }[c.level];
+  return `<span class="tag conf-${c.level}"><i></i>${txt}</span>${far}`;
+}
+function extraTags(p) {
+  const t = [];
+  const w = p.window;
+  if (!w || state.mode === 'van') return '';
+  const aggs = state.mode === 'night' ? Object.values(w.agg || {}) : [w.agg];
+  if (aggs.some((a) => a?.thunder)) t.push('<span class="tag warn-tag">⚡ Gewitter</span>');
+  if (aggs.some((a) => a?.snow > 0.5)) t.push('<span class="tag">❄️ Neuschnee</span>');
+  if (p.elevation != null && (state.minElev || p.elevation >= 800)) t.push(`<span class="tag">⛰️ ${Math.round(p.elevation)} m</span>`);
+  return t.join('');
+}
+function linkFor(p) {
+  if (state.mode === 'van') return { href: park4nightUrl(p.lat, p.lon), label: 'Park4Night' };
+  return { href: komootUrl(p.lat, p.lon, placeName(p) || 'Region', state.mode === 'night' ? 15 : 20), label: 'Komoot' };
+}
+function cardMeta(p) {
+  const w = p.window;
+  const dist = `${Math.round(p.distKm)} km · ${formatDuration(driveHours(p.distKm, settings.detour, settings.speed))}`;
+  if (state.mode === 'van') return `${fmtRange(p.days[w.start].date, p.days[w.start + state.days - 1].date)} · ${dist}`;
+  if (state.mode === 'day') return `${relIso(w.date)} · ${dryText(w.agg)} · ${dist}`;
+  return `Nacht ${relIso(w.date)} → ${fmtDate(addDays(w.date, 1))} · ${dist}`;
+}
+function cardStrip(p) {
+  const w = p.window;
+  if (state.mode === 'van') {
+    let cells = '';
+    for (let i = w.start; i < w.start + state.days; i++) {
+      const d = p.days[i];
+      if (!d) continue;
+      cells += `<div class="dc" style="--c:${scoreColor(p.dayScores[i] ?? 0)}">
+        <div class="dc-d">${WD[asDate(d.date).getDay()]}</div><div class="dc-i">${weatherIcon(d)}</div>
+        <div class="dc-t"><b>${round(d.tmax)}°</b> ${round(d.tmin)}°</div>
+        <div class="dc-r">${mm(d.precip)} mm</div><div class="dc-s">${hours(d.sunshine)} h ☀︎</div></div>`;
+    }
+    return `<div class="strip">${cells}</div>`;
+  }
+  if (state.mode === 'day') {
+    const rows = hourRows(p.h, w.date, 8, 11).filter((r) => r.hour % 2 === 0);
+    return `<div class="strip hours">${rows.map((r) => `<div class="hc">
+      <div class="dc-d">${r.hour}</div><div class="dc-i">${codeIcon(r.code)}</div>
+      <div class="dc-t"><b>${round(r.t)}°</b></div>
+      <div class="dc-r">${r.pp != null ? `${r.pp}%` : `${mm(r.p)}`}</div></div>`).join('')}</div>`;
+  }
+  const { afternoon: a, night: n, morning: m } = w.agg;
+  const pa = w.parts;
+  const comfortEff = pa.night.comfortEff;
+  const coldTxt = n.tmin >= comfortEff + 2 ? 'Schlafsack ok' : n.tmin >= comfortEff - 2 ? 'grenzwertig' : 'zu kalt';
+  const cell = (label, ico, main, sub, score) => `<div class="dc wide" style="--c:${scoreColor(score)}">
+    <div class="dc-d">${label}</div><div class="dc-i">${ico}</div><div class="dc-t">${main}</div><div class="dc-r">${sub}</div></div>`;
+  return `<div class="strip">
+    ${cell('Nachmittag', aggIcon(a), `<b>${round(a.tmax)}°</b>`, `${mm(a.precip)} mm`, pa.afternoon.score)}
+    ${cell('Nacht', aggIcon(n, true), `<b>${round(n.tmin)}°</b> ${coldTxt}`, `${mm(n.precip)} mm · Böen ${round(n.gustMax)}`, pa.night.score)}
+    ${cell('Morgen', aggIcon(m), `<b>${round(m.tmax)}°</b>`, `${mm(m.precip)} mm`, pa.morning.score)}
+  </div>`;
 }
 
+// ---------- Liste ----------
 function renderList() {
   const v = $('#view-list');
   if (!state.start) {
     v.innerHTML = `
       <div class="hero">
-        <div class="hero-emoji">🚐☀️</div>
-        <h2>Wohin mit dem Camper?</h2>
-        <p>Wir finden die Gegend mit dem besten Wetter in den nächsten 14 Tagen. Stellplätze sucht ihr dann in Park4Night.</p>
+        <div class="hero-emoji">${M().icon}☀️</div>
+        <h2>Wo ist das beste Wetter?</h2>
+        <p>Für eine Van-Tour, eine Tageswanderung oder einen Overnighter: Wir finden Ort und Zeitpunkt mit dem besten Wetter der nächsten 14 Tage.</p>
       </div>
+      <div class="mode-cards">${Object.entries(MODES).map(([id, m]) =>
+        `<button class="mode-card${id === state.mode ? ' on' : ''}" data-mode="${id}"><span>${m.icon}</span><b>${m.name}</b></button>`).join('')}</div>
       <ul class="list-group inset">
         <li><button data-act="gps"><span class="li-ico blue">${icon('loc')}</span><span class="li-t">Von meinem Standort</span>${icon('next', 'chev')}</button></li>
         <li><button data-act="search"><span class="li-ico gray">${icon('search')}</span><span class="li-t">Ort suchen</span>${icon('next', 'chev')}</button></li>
@@ -436,7 +659,6 @@ function renderList() {
       </ul>`;
     return;
   }
-  const p = settings.profiles[state.profile];
   const head = (title, sub, refresh = true) => `
     <header class="list-head">
       <div><h2>${title}</h2><p>${sub}</p></div>
@@ -458,41 +680,47 @@ function renderList() {
   }
   const age = Math.round((Date.now() - state.lastRun) / 60000);
   const ageTxt = age < 2 ? 'gerade aktualisiert' : age < 60 ? `vor ${age} min` : `vor ${Math.round(age / 60)} h`;
-  const changed = state.data.radius !== state.radius || haversineKm(state.data.center, state.start) > 1;
+  const changed = state.data.radius !== radius() || haversineKm(state.data.center, state.start) > 1;
   const notes = [];
   if (changed) notes.push('<div class="note warn">Start oder Umkreis geändert – zum Neuladen ↻ tippen.</div>');
   if (state.startClamped != null) notes.push(`<div class="note warn">Start auf ${relDay(state.startClamped)} vorgezogen, damit ${state.days} Tage in die Prognose passen.</div>`);
+  if (state.minElev && state.scored.length < state.data.points.length * 0.15) notes.push(`<div class="note">Nur wenige Orte liegen über ${state.minElev} m. ⛰️-Filter antippen zum Ändern.</div>`);
+  const what = state.mode === 'night' ? `${SHELTERS[state.shelter].icon} ${SHELTERS[state.shelter].name}` : `${settings.profiles[profileId()].icon} ${esc(settings.profiles[profileId()].name)}`;
+  const sub = `${what}${state.dog ? ' · 🐕' : ''} · ${state.scored.length} Orte · ${ageTxt}`;
   if (!state.regions.length) {
-    v.innerHTML = head('Keine Treffer', `${p.icon} ${esc(p.name)} · ${ageTxt}`) + notes.join('') +
-      '<div class="error-box"><p>Kein passendes Fenster. Kürzere Reisedauer oder früheren Start probieren.</p></div>';
+    v.innerHTML = head('Keine Treffer', sub) + notes.join('') +
+      '<div class="error-box"><p>Nichts Passendes gefunden. Anderen Zeitraum, Umkreis oder Höhenfilter probieren.</p></div>';
     return;
   }
-  v.innerHTML = head(`Top ${state.regions.length} Regionen`, `${p.icon} ${esc(p.name)} · ${state.data.points.length} Orte geprüft · ${ageTxt}`) +
-    notes.join('') +
+  const title = { van: `Top ${state.regions.length} Regionen`, day: `Top ${state.regions.length} für eure Tour`, night: `Top ${state.regions.length} Nächte` }[state.mode];
+  v.innerHTML = head(title, sub) + notes.join('') +
     `<ol class="cards">${state.regions.map((r, i) => {
       const w = r.window;
+      const link = linkFor(r);
       return `<li class="card" data-i="${i}" tabindex="0">
         <div class="card-top">
           <span class="rank" style="--c:${scoreColor(w.score)}">${i + 1}</span>
           <div class="card-main">
             <div class="card-title">${titleHtml(r)}</div>
             <div class="rating">${bubbles(w.score)}<b>${Math.round(w.score)}</b><span>${ratingLabel(w.score)}</span></div>
-            <div class="card-meta">${fmtRange(r.days[w.start].date, r.days[w.start + state.days - 1].date)} · ${Math.round(r.distKm)} km · ${formatDuration(driveHours(r.distKm, settings.detour, settings.speed))}</div>
+            <div class="card-meta">${cardMeta(r)}</div>
           </div>
         </div>
-        ${dayStrip(r)}
+        ${cardStrip(r)}
         <div class="card-foot">
-          <div class="tags">${confBadge(r)}</div>
-          <a class="p4n-btn" href="${park4nightUrl(r.lat, r.lon)}" target="_blank" rel="noopener" data-stop>Park4Night ${icon('next')}</a>
+          <div class="tags">${confBadge(r)}${extraTags(r)}</div>
+          <a class="p4n-btn" href="${link.href}" target="_blank" rel="noopener" data-stop>${link.label} ${icon('next')}</a>
         </div>
       </li>`;
     }).join('')}</ol>
-    <p class="fine center">ℹ️ Prognosen ab Tag 10 sind unsicher – kurz vor der Abfahrt nochmal prüfen.</p>
+    <p class="fine center">ℹ️ Prognosen ab Tag 10 sind unsicher – kurz vor dem Start nochmal prüfen.</p>
     <p class="fine center attrib">Wetter: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> · Karte: © OpenStreetMap-Mitwirkende · Küsten: Natural Earth</p>`;
 }
 
 $('#view-list').addEventListener('click', (e) => {
   if (e.target.closest('[data-stop]')) return;
+  const mc = e.target.closest('[data-mode]');
+  if (mc) { state.mode = mc.dataset.mode; persist(); renderTop(); renderList(); return; }
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (act === 'gps') return useGps();
   if (act === 'search') return $('#btn-open-search').click();
@@ -541,12 +769,8 @@ function refreshViews() {
 }
 function confidenceFor(p) {
   const ens = state.ensemble.get(`${p.lat},${p.lon}`);
-  if (!ens) return { level: 'unbekannt', coveredDays: 0 };
-  const idx = [];
-  for (let i = p.window.start; i < p.window.start + state.days; i++) {
-    const j = ens.dates.indexOf(p.days[i]?.date);
-    if (j >= 0) idx.push(j);
-  }
+  if (!ens || !p.window) return { level: 'unbekannt', coveredDays: 0 };
+  const idx = windowDates(p).map((d) => ens.dates.indexOf(d)).filter((j) => j >= 0);
   return ensembleConfidence(ens, idx);
 }
 
@@ -565,7 +789,7 @@ function showDetail(p, { keepSnap = false, fly = true } = {}) {
   if (!keepSnap && sheet.snap === 'peek') sheet.setSnap('half');
   const ri = state.regions.indexOf(p);
   ui.select(ri >= 0 ? ri : null);
-  if (fly) ui.flyTo(p);
+  if (fly) ui.flyTo(p, state.mode === 'van' ? undefined : Math.max(ui.map.getZoom(), 9));
   if (!state.names.has(k)) {
     reverseName(p.lat, p.lon).then((n) => { state.names.set(k, n); if (state.detail === p) refreshViews(); });
   }
@@ -584,26 +808,55 @@ function closeDetail(restore = true) {
   if (restore) $('#sheet-scroll').scrollTop = state.listScroll;
 }
 
-function forecastRows(p, from, to, scale) {
+function tempBar(lo, hi, scale) {
+  const a = ((lo ?? scale.min) - scale.min) / (scale.max - scale.min) * 100;
+  const b = ((hi ?? scale.max) - scale.min) / (scale.max - scale.min) * 100;
+  return `<span class="fc-bar"><i style="left:${a}%;right:${100 - b}%"></i></span>`;
+}
+function vanRows(p, from, to, scale) {
   let rows = '';
   for (let i = from; i < to; i++) {
     const d = p.days[i];
     if (!d) continue;
     const inWin = p.window && i >= p.window.start && i < p.window.start + state.days;
-    const lo = ((d.tmin ?? scale.min) - scale.min) / (scale.max - scale.min) * 100;
-    const hi = ((d.tmax ?? scale.max) - scale.min) / (scale.max - scale.min) * 100;
     const s = p.dayScores[i];
     rows += `<div class="fc-row${inWin ? ' win' : ''}">
       <span class="fc-day">${i === 0 ? 'Heute' : WD[asDate(d.date).getDay()]}<small>${asDate(d.date).getDate()}.${asDate(d.date).getMonth() + 1}.</small></span>
       <span class="fc-ico">${weatherIcon(d)}${d.precipProb != null && d.precipProb >= 30 ? `<small>${d.precipProb}%</small>` : ''}</span>
-      <span class="fc-min">${round(d.tmin)}°</span>
-      <span class="fc-bar"><i style="left:${lo}%;right:${100 - hi}%"></i></span>
-      <span class="fc-max">${round(d.tmax)}°</span>
+      <span class="fc-min">${round(d.tmin)}°</span>${tempBar(d.tmin, d.tmax, scale)}<span class="fc-max">${round(d.tmax)}°</span>
       <span class="fc-x">${mm(d.precip)} mm<br>${hours(d.sunshine)} h ☀︎</span>
       <span class="pill" style="--c:${scoreColor(s ?? 0)}">${s == null ? '–' : Math.round(s)}</span>
     </div>`;
   }
   return rows;
+}
+function hourTable(p, date, from, n, mark) {
+  const rows = hourRows(p.h, date, from, n);
+  return `<div class="hour-table">${rows.map((r) => {
+    const night = r.hour >= 20 || r.hour < 7;
+    const inMark = mark && (mark[0] <= mark[1] ? r.hour >= mark[0] && r.hour < mark[1] : r.hour >= mark[0] || r.hour < mark[1]);
+    return `<div class="hr${inMark ? ' win' : ''}">
+      <span class="hr-h">${String(r.hour).padStart(2, '0')}</span>
+      <span class="hr-i">${codeIcon(r.code, night)}</span>
+      <span class="hr-t">${round(r.t)}°</span>
+      <span class="hr-p">${r.p >= 0.1 ? `${mm(r.p)} mm` : ''}${r.pp != null && r.pp >= 20 ? ` <em>${r.pp}%</em>` : ''}</span>
+      <span class="hr-w">${round(r.gust)}<small> km/h</small></span>
+    </div>`;
+  }).join('')}</div>`;
+}
+function otherCands(p) {
+  const list = (p.cands || []).filter((c) => c.score != null);
+  if (list.length < 2) return '';
+  const night = state.mode === 'night';
+  return `<section class="block"><h3>${night ? 'Andere Nächte hier' : 'Andere Tage hier'}</h3>
+    <div class="cand-list">${list.map((c) => `<button class="cand${c.date === p.window.date ? ' on' : ''}" data-cand="${c.date}">
+      <span>${night ? `${relIso(c.date)} → ${WD[asDate(addDays(c.date, 1)).getDay()]}` : relIso(c.date)}</span>
+      <span class="pill" style="--c:${scoreColor(c.score)}">${Math.round(c.score)}</span></button>`).join('')}</div></section>`;
+}
+function sunTimes(p, date) {
+  const i = p.h?.daily.date.indexOf(date);
+  if (i == null || i < 0) return null;
+  return { rise: hhmm(p.h.daily.sunrise[i]), set: hhmm(p.h.daily.sunset[i]) };
 }
 
 function renderDetail(p) {
@@ -611,13 +864,74 @@ function renderDetail(p) {
   const ri = state.regions.indexOf(p);
   const region = ri >= 0 ? p : null;
   const km = p.distKm ?? haversineKm(state.data.center, p);
-  const temps = p.days.flatMap((d) => [d.tmin, d.tmax]).filter((x) => x != null);
-  const scale = { min: Math.floor(Math.min(...temps)) - 1, max: Math.ceil(Math.max(...temps)) + 1 };
-  const winEnd = w ? w.start + state.days : 0;
+  const drive = formatDuration(driveHours(km, settings.detour, settings.speed));
   const sub = subHtml(p);
+  const name = placeName(p) || 'Region';
+  const conf = p.confidence ? { hoch: 'Sicher', mittel: 'Mittel', niedrig: 'Unsicher', unbekannt: '–' }[p.confidence.level] : '…';
+  const tile = (label, value, small, cls = '') => `<div class="tile"><small>${label}</small><b class="${cls}">${value}</b><span>${small}</span></div>`;
+  const confTile = w ? tile('Prognose', conf, windowEndsLate(p) ? 'reicht bis Tag 10+' : 'Ensemble-Streuung', `conf-txt-${p.confidence?.level || 'x'}`) : '';
+  const elevTile = p.elevation != null ? tile('Höhe', `${Math.round(p.elevation)} m`, 'über Meer') : '';
+  const driveTile = tile('Anfahrt', drive, `${Math.round(km)} km Luftlinie`);
+
+  let actions, tiles = '', body = '';
+  const act = (href, ico, label, primary = false) => `<a class="act${primary ? ' primary' : ''}" href="${href}" target="_blank" rel="noopener"><span class="act-ico">${ico}</span><span>${label}</span></a>`;
+  const btn = (a, ico, label) => `<button class="act" data-act="${a}"><span class="act-ico">${icon(ico)}</span><span>${label}</span></button>`;
+  const komoot = act(komootUrl(p.lat, p.lon, name, state.mode === 'night' ? 15 : 20), '<span class="act-ico k">K</span>', 'Komoot', true);
+  const p4n = act(park4nightUrl(p.lat, p.lon), '<span class="act-ico p">P</span>', 'Park4Night', state.mode === 'van');
+  const route = act(appleMapsUrl(p.lat, p.lon), icon('route'), 'Route');
+
+  if (state.mode === 'van') {
+    actions = p4n + route + btn('copy', 'copy', 'Kopieren') + btn('share', 'share', 'Teilen');
+    const temps = p.days.flatMap((d) => [d.tmin, d.tmax]).filter((x) => x != null);
+    const scale = { min: Math.floor(Math.min(...temps)) - 1, max: Math.ceil(Math.max(...temps)) + 1 };
+    const winEnd = w ? w.start + state.days : 0;
+    if (w) tiles += tile('Bestes Fenster', fmtRange(p.days[w.start].date, p.days[winEnd - 1].date), `${WDL[asDate(p.days[w.start].date).getDay()]} los`);
+    tiles += driveTile + confTile + elevTile;
+    if (w) body += `<section class="block"><h3>Wetter im Fenster <span class="muted">Ø ${Math.round(w.mean)} · schlechtester Tag ${Math.round(w.min)}</span></h3>
+      <div class="forecast">${vanRows(p, w.start, winEnd, scale)}</div></section>`;
+    body += `<details class="block" ${w ? '' : 'open'}><summary><h3>Alle 16 Tage</h3></summary><div class="forecast">${vanRows(p, 0, p.days.length, scale)}</div></details>`;
+  } else if (state.mode === 'day') {
+    actions = komoot + route + btn('copy', 'copy', 'Kopieren') + btn('share', 'share', 'Teilen');
+    const a = w?.agg;
+    const sun = w ? sunTimes(p, w.date) : null;
+    if (w) {
+      tiles += tile('Bester Tag', relIso(w.date), WDL[asDate(w.date).getDay()]);
+      tiles += tile('Trocken', a.dryHours >= a.n ? 'ganztags' : a.dryBlock ? `${a.dryBlock[0]}–${a.dryBlock[1]} Uhr` : 'kaum', `${a.dryHours} von ${a.n} Wanderstunden`);
+      if (sun) tiles += tile('Tageslicht', `${sun.rise}–${sun.set}`, 'Sonnenauf-/untergang');
+    }
+    tiles += driveTile + elevTile + confTile;
+    if (w) {
+      body += `<section class="block"><h3>Stunden am ${relIso(w.date)} <span class="muted">${round(a.tmin)}–${round(a.tmax)}° · ${mm(a.precip)} mm · ${hours(a.sunSec)} h Sonne</span></h3>
+        ${hourTable(p, w.date, 6, 16, [settings.hikeStart, settings.hikeEnd])}</section>`;
+      body += otherCands(p);
+    }
+  } else {
+    actions = komoot + p4n + route + btn('share', 'share', 'Teilen');
+    if (w) {
+      const { afternoon: a, night: n, morning: m } = w.agg;
+      const pa = w.parts;
+      const sh = SHELTERS[state.shelter];
+      const sunE = sunTimes(p, w.date), sunM = sunTimes(p, addDays(w.date, 1));
+      tiles += tile('Beste Nacht', `${WD[asDate(w.date).getDay()]} → ${WD[asDate(addDays(w.date, 1)).getDay()]}`, `${fmtDate(w.date)} – ${fmtDate(addDays(w.date, 1))}`);
+      tiles += tile('Tiefstwert', `${round(n.tmin)} °C`, `${sh.name}: ok ab ${round(pa.night.comfortEff + 2)} °C`, n.tmin >= pa.night.comfortEff + 2 ? 'conf-txt-hoch' : n.tmin >= pa.night.comfortEff - 2 ? 'conf-txt-mittel' : 'conf-txt-niedrig');
+      tiles += tile('Wind nachts', `${round(n.gustMax)} km/h`, 'max. Böen');
+      if (sunE && sunM) tiles += tile('Dunkel', `${sunE.set}–${sunM.rise}`, 'Sonnenunter-/aufgang');
+      tiles += driveTile + elevTile + confTile;
+      const part = (label, ico, score, lines) => `<div class="part"><div class="part-h"><span>${ico} ${label}</span><span class="pill" style="--c:${scoreColor(score)}">${Math.round(score)}</span></div><div class="part-b">${lines}</div></div>`;
+      body += `<section class="block"><h3>Ablauf</h3><div class="parts">
+        ${part('Nachmittag 14–20', aggIcon(a), pa.afternoon.score, `${round(a.tmax)}° · ${mm(a.precip)} mm · ${dryText(a)}`)}
+        ${part('Nacht 20–7', aggIcon(n, true), pa.night.score, `Tief ${round(n.tmin)}° · ${mm(n.precip)} mm · Böen ${round(n.gustMax)} km/h`)}
+        ${part('Morgen 7–11', aggIcon(m), pa.morning.score, `${round(m.tmin)}–${round(m.tmax)}° · ${mm(m.precip)} mm · ${m.precip < 0.2 ? 'trocken einpacken' : 'nass einpacken'}`)}
+      </div></section>`;
+      body += `<details class="block"><summary><h3>Stunden ${fmtDate(w.date)} 14 Uhr → ${fmtDate(addDays(w.date, 1))} 11 Uhr</h3></summary>
+        ${hourTable(p, w.date, 14, 22, [20, 7])}</details>`;
+      body += otherCands(p);
+    } else tiles += driveTile + elevTile;
+  }
+
   $('#view-detail').innerHTML = `
     <div class="detail-nav">
-      <button class="back-btn" data-act="back">${icon('back')} Regionen</button>
+      <button class="back-btn" data-act="back">${icon('back')} ${state.mode === 'van' ? 'Regionen' : 'Liste'}</button>
       ${region ? `<div class="pager">
         <button class="icon-round soft" data-act="prev" ${ri === 0 ? 'disabled' : ''} aria-label="Vorherige">${icon('back')}</button>
         <span>${ri + 1} / ${state.regions.length}</span>
@@ -628,32 +942,22 @@ function renderDetail(p) {
       <h2>${titleHtml(p)}</h2>
       <p class="muted">${sub || 'Region'}${region?.members > 1 ? ` · ${region.members} Rasterpunkte` : ''}</p>
       ${w ? `<div class="rating big">${bubbles(w.score)}<b>${Math.round(w.score)}</b><span>${ratingLabel(w.score)}</span></div>` : ''}
+      ${w && state.mode !== 'van' ? `<div class="tags detail-tags">${extraTags(p)}</div>` : ''}
     </div>
-    <div class="actions">
-      <a class="act primary" href="${park4nightUrl(p.lat, p.lon)}" target="_blank" rel="noopener"><span class="act-ico p">P</span><span>Park4Night</span></a>
-      <a class="act" href="${appleMapsUrl(p.lat, p.lon)}" target="_blank" rel="noopener"><span class="act-ico">${icon('route')}</span><span>Route</span></a>
-      <button class="act" data-act="copy"><span class="act-ico">${icon('copy')}</span><span>Kopieren</span></button>
-      <button class="act" data-act="share"><span class="act-ico">${icon('share')}</span><span>Teilen</span></button>
-    </div>
-    <div class="tiles">
-      ${w ? `<div class="tile"><small>Bestes Fenster</small><b>${fmtRange(p.days[w.start].date, p.days[winEnd - 1].date)}</b><span>${WDL[asDate(p.days[w.start].date).getDay()]} los</span></div>` : ''}
-      <div class="tile"><small>Anfahrt</small><b>${formatDuration(driveHours(km, settings.detour, settings.speed))}</b><span>${Math.round(km)} km Luftlinie</span></div>
-      ${w ? `<div class="tile"><small>Prognose</small><b class="conf-txt-${p.confidence?.level || 'x'}">${p.confidence ? { hoch: 'Sicher', mittel: 'Mittel', niedrig: 'Unsicher', unbekannt: '–' }[p.confidence.level] : '…'}</b><span>${winEnd - 1 >= 9 ? 'reicht bis Tag 10+' : 'Ensemble-Streuung'}</span></div>` : ''}
-      ${p.elevation != null ? `<div class="tile"><small>Höhe</small><b>${Math.round(p.elevation)} m</b><span>über Meer</span></div>` : ''}
-    </div>
-    ${w ? `<section class="block">
-      <h3>Wetter im Fenster <span class="muted">Ø ${Math.round(w.mean)} · schlechtester Tag ${Math.round(w.min)}</span></h3>
-      <div class="forecast">${forecastRows(p, w.start, winEnd, scale)}</div>
-    </section>` : ''}
-    <details class="block" ${w ? '' : 'open'}>
-      <summary><h3>Alle 16 Tage</h3></summary>
-      <div class="forecast">${forecastRows(p, 0, p.days.length, scale)}</div>
-    </details>
-    <p class="fine">${coordText(p.lat, p.lon)} · <a href="${park4nightWebUrl(p.lat, p.lon)}" target="_blank" rel="noopener">Park4Night im Browser</a></p>`;
+    <div class="actions">${actions}</div>
+    <div class="tiles">${tiles}</div>
+    ${body}
+    <p class="fine">${coordText(p.lat, p.lon)} · <button class="link-btn" data-act="copy">Koordinaten kopieren</button> · <a href="${park4nightWebUrl(p.lat, p.lon)}" target="_blank" rel="noopener">Park4Night im Browser</a></p>`;
 }
 $('#view-detail').addEventListener('click', async (e) => {
-  const act = e.target.closest('[data-act]')?.dataset.act;
+  const cand = e.target.closest('[data-cand]');
   const p = state.detail;
+  if (cand && p) {
+    const c = p.cands.find((x) => x.date === cand.dataset.cand);
+    if (c && c.score != null) { p.window = { ...c, ci: p.cands.indexOf(c) }; p.confidence = state.ensemble.has(`${p.lat},${p.lon}`) ? confidenceFor(p) : null; renderDetail(p); }
+    return;
+  }
+  const act = e.target.closest('[data-act]')?.dataset.act;
   if (!act || !p) return;
   if (act === 'back') closeDetail();
   if (act === 'prev' || act === 'next') {
@@ -665,13 +969,17 @@ $('#view-detail').addEventListener('click', async (e) => {
     toast(ok ? `Koordinaten kopiert: ${coordText(p.lat, p.lon)}` : 'Kopieren nicht möglich');
   }
   if (act === 'share') {
-    const name = nameOf(p)?.name?.split(' · ')[0] || coordText(p.lat, p.lon);
+    const name = placeName(p) || coordText(p.lat, p.lon);
     const w = p.window;
-    const text = `Wetterwahl: ${name}${w ? ` – ${ratingLabel(w.score)} (${Math.round(w.score)}) ${fmtRange(p.days[w.start].date, p.days[w.start + state.days - 1].date)}` : ''}`;
+    let when = '';
+    if (w) when = state.mode === 'van' ? fmtRange(p.days[w.start].date, p.days[w.start + state.days - 1].date)
+      : state.mode === 'night' ? `Nacht ${fmtDate(w.date)} → ${fmtDate(addDays(w.date, 1))}` : fmtDate(w.date);
+    const link = linkFor(p).href;
+    const text = `Wetterwahl ${M().icon} ${name}${w ? ` – ${ratingLabel(w.score)} (${Math.round(w.score)}) ${when}` : ''}`;
     if (navigator.share) {
-      try { await navigator.share({ title: name, text, url: park4nightUrl(p.lat, p.lon) }); } catch { /* abgebrochen */ }
+      try { await navigator.share({ title: name, text, url: link }); } catch { /* abgebrochen */ }
     } else {
-      const ok = await copyText(`${text}\n${park4nightUrl(p.lat, p.lon)}`);
+      const ok = await copyText(`${text}\n${link}`);
       toast(ok ? 'Link kopiert' : 'Teilen nicht möglich');
     }
   }
@@ -681,7 +989,7 @@ $('#view-detail').addEventListener('click', async (e) => {
   let x0 = null, y0 = 0;
   const el = $('#view-detail');
   el.addEventListener('touchstart', (e) => {
-    if (e.target.closest('.tiles, .forecast')) { x0 = null; return; }
+    if (e.target.closest('.tiles, .forecast, .hour-table, .cand-list')) { x0 = null; return; }
     x0 = e.touches[0].clientX; y0 = e.touches[0].clientY;
   }, { passive: true });
   el.addEventListener('touchend', (e) => {
@@ -711,7 +1019,7 @@ let settingsTab = null;
 const settingsDlg = $('#settings');
 
 function openSettings() {
-  settingsTab = state.profile;
+  settingsTab = state.mode === 'night' ? 'wandern' : profileId();
   renderSettings();
   settingsDlg.showModal();
 }
@@ -721,6 +1029,14 @@ function renderSettings() {
   settingsDlg.innerHTML = `
     <div class="ms-grip"></div>
     <div class="ms-head"><h3>Einstellungen</h3><button class="text-btn strong" data-done>Fertig</button></div>
+    <div class="group-label">Wandern & Übernachten</div>
+    <div class="group">
+      <label class="row num"><span>Wanderzeit von</span><span class="val"><input type="number" step="1" min="4" max="14" data-g="hikeStart" value="${settings.hikeStart}"><em>Uhr</em></span></label>
+      <label class="row num"><span>Wanderzeit bis</span><span class="val"><input type="number" step="1" min="10" max="22" data-g="hikeEnd" value="${settings.hikeEnd}"><em>Uhr</em></span></label>
+      <label class="row num"><span>Schlafsack-Komfort</span><span class="val"><input type="number" step="1" min="-20" max="20" data-g="comfort" value="${settings.comfort}"><em>°C</em></span></label>
+    </div>
+    <p class="fine">Hängematte zählt 4 °C kälter (Auskühlen von unten), der Van 6 °C wärmer. 🐕 Hund dabei: Wohlfühlen bis 25 °C, ab 28 °C stark abwerten.</p>
+    <div class="group-label">Wetterprofile</div>
     <div class="seg wide">${Object.entries(settings.profiles).map(([id, pr]) =>
       `<button data-tab="${id}" class="${id === settingsTab ? 'on' : ''}">${pr.icon} ${esc(pr.name.split(' ')[0])}</button>`).join('')}</div>
     <div class="group-label">Gewichtung · ${esc(p.name)}</div>
@@ -744,7 +1060,7 @@ function renderSettings() {
         <select data-g="maxPoints">${[[200, 'Grob · 200 Orte'], [400, 'Normal · 400 Orte'], [700, 'Fein · 700 Orte']].map(([v, l]) =>
           `<option value="${v}" ${+settings.maxPoints === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
       <label class="row num"><span>Umwegfaktor Straße</span><span class="val"><input type="number" step="0.05" min="1" max="2" data-g="detour" value="${settings.detour}"><em>×</em></span></label>
-      <label class="row num"><span>Ø Tempo Camper</span><span class="val"><input type="number" step="5" min="30" max="120" data-g="speed" value="${settings.speed}"><em>km/h</em></span></label>
+      <label class="row num"><span>Ø Tempo Auto/Van</span><span class="val"><input type="number" step="5" min="30" max="120" data-g="speed" value="${settings.speed}"><em>km/h</em></span></label>
       <label class="row num"><span>Darstellung</span>
         <select data-g="theme">${[['auto', 'Automatisch'], ['dark', 'Dunkel'], ['light', 'Hell']].map(([v, l]) =>
           `<option value="${v}" ${settings.theme === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
@@ -778,7 +1094,13 @@ settingsDlg.addEventListener('input', (e) => {
     p[t.dataset.f] = t.dataset.scale ? v / +t.dataset.scale : v;
     if (t.dataset.scale) t.nextElementSibling.textContent = `${t.value}%`;
   } else if (t.dataset.g) {
-    settings[t.dataset.g] = t.dataset.g === 'theme' ? t.value : parseFloat(t.value);
+    if (t.dataset.g === 'theme') settings.theme = t.value;
+    else {
+      const v = parseFloat(String(t.value).replace(',', '.'));
+      if (!Number.isFinite(v)) return;
+      settings[t.dataset.g] = v;
+      if (settings.hikeEnd <= settings.hikeStart + 1) settings.hikeEnd = settings.hikeStart + 2;
+    }
     if (t.dataset.g === 'theme') { applyTheme(); ui.setTheme(isDark()); }
   } else return;
   saveSettings(settings);
@@ -787,7 +1109,7 @@ settingsDlg.addEventListener('input', (e) => {
 });
 settingsDlg.addEventListener('close', () => renderTop());
 
-// Dialoge schließen sich bei Tipp auf den Hintergrund; Wischen nach unten schließt Modal-Sheets
+// Modal-Sheets: Wischen nach unten am Griff schließt
 for (const dlg of [paramDlg, settingsDlg]) {
   let y0 = null;
   dlg.addEventListener('touchstart', (e) => { y0 = (dlg.scrollTop <= 0 && e.target.closest('.ms-grip, .ms-head')) ? e.touches[0].clientY : null; }, { passive: true });
@@ -799,7 +1121,7 @@ renderTop();
 renderList();
 if (state.start) {
   ui.setStart(state.start);
-  ui.setRadius(state.start, state.radius, true);
+  ui.setRadius(state.start, radius(), true);
   if (state.lastRun && Date.now() - state.lastRun < 3 * 3600e3) runSearch({ silent: true });
 } else {
   document.body.dataset.sheet = sheet.snap;

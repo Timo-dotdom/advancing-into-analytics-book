@@ -39,3 +39,13 @@ export async function copyText(text) {
     return ok;
   }
 }
+
+/**
+ * Komoot „Entdecken“ an Koordinaten (Wandertouren im Umkreis).
+ * /discover/* ist in Komoots apple-app-site-association als Universal Link registriert;
+ * die Webseite übernimmt @lat,lon und ergänzt map=true & max_distance (geprüft 11/2026).
+ */
+export function komootUrl(lat, lon, name = 'Region', radiusKm = 20, sport = 'hike') {
+  const slug = encodeURIComponent(String(name).split(' · ')[0].trim().replace(/\s+/g, '-') || 'Region');
+  return `https://www.komoot.com/de-de/discover/${slug}/@${lat.toFixed(5)},${lon.toFixed(5)}/tours?sport=${sport}&map=true&max_distance=${Math.round(radiusKm * 1000)}`;
+}

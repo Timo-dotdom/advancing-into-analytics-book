@@ -3,6 +3,22 @@
 PWA für Camper-Touren: **Wo im Umkreis X km ist in den nächsten 14 Tagen für N Tage am Stück das beste Wetter?**
 Statisch, ohne Build-Schritt, ohne API-Keys, ohne Kosten.
 
+## Modi
+| Modus | Frage | Daten | Ergebnis | Link |
+|---|---|---|---|---|
+| 🚐 Van-Tour | Wo sind N Tage am Stück gut? (50–1500 km) | Tageswerte 16 Tage | bestes Startdatum | Park4Night |
+| 🥾 Tagestour | Welcher Tag + Ort für eine Wanderung? (10–250 km) | Stundenwerte, Wanderzeit 9–17 Uhr | bester Tag, trockenes Zeitfenster | Komoot |
+| ⛺ Overnighter | Welche Nacht + Ort? (10–400 km) | Stundenwerte: Nachmittag 14–20, Nacht 20–7, Morgen 7–11 | beste Nacht, Tiefstwert vs. Schlafsack | Komoot + Park4Night |
+
+- Profile Tagestour: Wandern, ⛰️ Bergtour (kühler, windempfindlicher, starke Gewitter-/Neuschnee-Abwertung), Hauptsache trocken
+- Overnighter-Schlafplatz: ⛺ Zelt, 🌳 Hängematte (zählt 4 °C kälter, windempfindlich), 🚐 Van (6 °C wärmer, Regen fast egal)
+- 🐕 Hund-Schalter: Wohlfühlen bis 25 °C, ab 28 °C starkes Veto (nicht bei „Sonne & Baden“)
+- ⛰️ Höhenfilter: egal / ab 500 m / ab 1000 m
+- Suchzeitraum: Wochenende (Sa+So bzw. Nächte Fr→Sa, Sa→So), 3, 7 oder 14 Tage
+- Kälte wird beim Wandern nur moderat abgewertet (kein Veto), Hitze stark; Gewitter ×0,3 (Bergtour ×0,2)
+- Komoot-Link: `komoot.com/de-de/discover/<Name>/@lat,lon/tours?sport=hike&map=true&max_distance=…` (Universal Link `/discover/*`)
+- Stundendaten werden in IndexedDB zwischengespeichert (3 h)
+
 ## Bedienung (App-Layout)
 - Vollbild-Karte, oben Suchleiste + Filter-Chips (Umkreis, Reise, Wetterprofil), Änderungen wirken sofort
 - Bottom-Sheet zum Wischen (klein / halb / voll) mit Top-10-Bewertungskarten; auf dem Desktop feste Seitenleiste

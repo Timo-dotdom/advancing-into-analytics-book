@@ -10,6 +10,9 @@ export const DEFAULT_SETTINGS = {
   detour: 1.3,
   speed: 70,
   theme: 'auto',
+  comfort: 3,      // Schlafsack-Komforttemperatur °C
+  hikeStart: 9,    // Wanderzeit
+  hikeEnd: 17,
 };
 
 const clone = (o) => JSON.parse(JSON.stringify(o));
